@@ -1,0 +1,22 @@
+ 
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: proyecto2_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: reservasDB123!
+      POSTGRES_DB: reservas_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # healthcheck:
+    #   test: ["CMD-SHELL", "pg_isready -U proyecto_user -d reservas_db"]
+    #   interval: 5s
+    #   timeout: 5s
+    #   retries: 5
+
+volumes:
+  postgres_data:
