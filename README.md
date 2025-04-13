@@ -36,7 +36,7 @@ Asegúrate de tener [Docker](https://www.docker.com/) instalado.
    docker-compose up -d
    ```
 
-2. PostgreSQL estará corriendo en el puerto `5432`.  
+2. PostgreSQL estará corriendo en el puerto `5432` (Si tienes una instancia de PostgreSQL inicializada la mayoría de veces es necesario apagarla en Servicios para que los servidores no colisionen).  
    Credenciales:
 
    ```
