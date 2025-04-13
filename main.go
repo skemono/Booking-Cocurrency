@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 
@@ -13,34 +16,44 @@ import (
 )
 
 const (
-	host     = "localhost"
-	port     = 5432
-	user     = "admin"
-	password = "reservasDB123!"
-	dbname   = "reservas_db"
+	host       = "localhost"
+	port       = 5432
+	user       = "admin"
+	password   = "reservasDB123!"
+	dbname     = "reservas_db"
+	totalSeats = 50 // Total de asientos disponibles para el evento.
 )
 
-// reserveAsiento intenta reservar un asiento para un evento dado utilizando una transacción.
-// Realiza los siguientes pasos:
-// 1. Inicia una transacción.
-// 2. Selecciona (y bloquea) el registro del asiento deseado usando FOR UPDATE.
-// 3. Verifica que el asiento aún esté disponible ("disponible").
-// 4. Actualiza el asiento a "reservado" y luego inserta un registro de reserva.
-// 5. Confirma la transacción o realiza un rollback en caso de error.
-func reserveAsiento(db *sql.DB, eventoID int, asientoNum int, userID string) error {
-	tx, err := db.Begin()
+// reservationResult almacena el resultado de cada intento de reserva.
+type reservationResult struct {
+	success  bool
+	duration time.Duration
+}
+
+// testResult contiene los resultados agregados de cada prueba.
+type testResult struct {
+	numUsuarios   int
+	isolationName string
+	successCount  int
+	failureCount  int
+	avgDuration   time.Duration
+}
+
+// reserveAsiento intenta reservar un asiento para un evento dado utilizando una transacción
+// con el nivel de aislamiento especificado.
+func reserveAsiento(db *sql.DB, eventoID int, asientoNum int, userID string, isolation sql.IsolationLevel) error {
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: isolation})
 	if err != nil {
 		return fmt.Errorf("iniciar transacción: %v", err)
 	}
 
-	// Bloquea la fila del asiento para prevenir actualizaciones concurrentes.
 	var asientoID int
 	var estado string
 	query := `
-	SELECT id, estado
-	FROM asientos
-	WHERE evento_id = $1 AND numero_asiento = $2
-	FOR UPDATE
+		SELECT id, estado
+		FROM asientos
+		WHERE evento_id = $1 AND numero_asiento = $2
+		FOR UPDATE
 	`
 	err = tx.QueryRow(query, eventoID, asientoNum).Scan(&asientoID, &estado)
 	if err != nil {
@@ -48,13 +61,13 @@ func reserveAsiento(db *sql.DB, eventoID int, asientoNum int, userID string) err
 		return fmt.Errorf("consulta de asiento: %v", err)
 	}
 
-	// Si el asiento ya está reservado, realiza un rollback y retorna un error.
+	// Si el asiento ya está reservado se cancela la transacción.
 	if estado != "disponible" {
 		tx.Rollback()
 		return fmt.Errorf("el asiento %d no está disponible", asientoNum)
 	}
 
-	// Actualiza el asiento para marcarlo como reservado.
+	// Actualiza el asiento a "reservado".
 	_, err = tx.Exec("UPDATE asientos SET estado = 'reservado' WHERE id = $1", asientoID)
 	if err != nil {
 		tx.Rollback()
@@ -79,6 +92,123 @@ func reserveAsiento(db *sql.DB, eventoID int, asientoNum int, userID string) err
 	return nil
 }
 
+// resetAllSeats restablece el estado de todos los asientos del evento a "disponible"
+// y elimina cualquier reserva previa asociada.
+func resetAllSeats(db *sql.DB, eventoID int) error {
+	_, err := db.Exec("UPDATE asientos SET estado = 'disponible' WHERE evento_id = $1", eventoID)
+	if err != nil {
+		return fmt.Errorf("resetear asientos: %v", err)
+	}
+
+	_, err = db.Exec("DELETE FROM reservas WHERE asiento_id IN (SELECT id FROM asientos WHERE evento_id = $1)", eventoID)
+	if err != nil {
+		return fmt.Errorf("eliminar reservas: %v", err)
+	}
+
+	return nil
+}
+
+// runTest ejecuta una prueba de reservas concurrentes con numUsuarios intentos utilizando el
+// nivel de aislamiento especificado y retorna un resumen.
+func runTest(db *sql.DB, numUsuarios int, isolation sql.IsolationLevel, isolationName string, eventoID int, totalSeats int) testResult {
+	// Restablece el estado de todos los asientos del evento.
+	if err := resetAllSeats(db, eventoID); err != nil {
+		log.Fatalf("Error al resetear asientos del evento: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	resultsChan := make(chan reservationResult, numUsuarios)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for i := 0; i < numUsuarios; i++ {
+		wg.Add(1)
+		go func(userID string) {
+			defer wg.Done()
+			start := time.Now()
+			// Selecciona un asiento al azar.
+			asientoNum := rnd.Intn(totalSeats) + 1
+			err := reserveAsiento(db, eventoID, asientoNum, userID, isolation)
+			duration := time.Since(start)
+			success := err == nil
+
+			resultsChan <- reservationResult{
+				success:  success,
+				duration: duration,
+			}
+
+			if !success {
+				log.Printf("Reserva fallida para %s en asiento %d: %v", userID, asientoNum, err)
+			} else {
+				log.Printf("Reserva exitosa para %s en asiento %d", userID, asientoNum)
+			}
+		}(fmt.Sprintf("user_%d", i+1))
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var successCount, failureCount int
+	var totalDuration time.Duration
+	count := 0
+
+	for r := range resultsChan {
+		count++
+		totalDuration += r.duration
+		if r.success {
+			successCount++
+		} else {
+			failureCount++
+		}
+	}
+
+	avgDuration := time.Duration(0)
+	if count > 0 {
+		avgDuration = totalDuration / time.Duration(count)
+	}
+
+	return testResult{
+		numUsuarios:   numUsuarios,
+		isolationName: isolationName,
+		successCount:  successCount,
+		failureCount:  failureCount,
+		avgDuration:   avgDuration,
+	}
+}
+
+// exportToCSV genera un archivo CSV con la información consolidada de las pruebas.
+func exportToCSV(results []testResult, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("error al crear el archivo CSV: %v", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Escribir encabezado.
+	header := []string{"Usuarios", "Nivel de Aislamiento", "Reservas Exitosas", "Reservas Fallidas", "Tiempo Promedio (ms)"}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("error al escribir el encabezado CSV: %v", err)
+	}
+
+	// Escribir cada resultado.
+	for _, r := range results {
+		record := []string{
+			fmt.Sprintf("%d", r.numUsuarios),
+			r.isolationName,
+			fmt.Sprintf("%d", r.successCount),
+			fmt.Sprintf("%d", r.failureCount),
+			fmt.Sprintf("%d", r.avgDuration.Milliseconds()),
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("error al escribir registro CSV: %v", err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	// Construye la cadena de conexión a PostgreSQL.
 	psqlInfo := fmt.Sprintf(
@@ -86,67 +216,57 @@ func main() {
 		host, port, user, password, dbname,
 	)
 
-	// Abre una conexión a la base de datos.
 	db, err := sql.Open("postgres", psqlInfo)
 	if err != nil {
 		log.Fatalf("Error al abrir la base de datos: %v", err)
 	}
 	defer db.Close()
 
-	// Verifica la conexión.
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Error al verificar la conexión: %v", err)
 	}
 
-	// -------------------------------
-	// Ejecutar migraciones con Goose
-	// -------------------------------
-	// Configura el dialecto como "postgres" para Goose.
+	// Ejecución de migraciones con Goose.
 	if err := goose.SetDialect("postgres"); err != nil {
 		log.Fatalf("Error al configurar el dialecto: %v", err)
 	}
-
-	// Ejecuta las migraciones desde la carpeta "./db".
 	if err := goose.Up(db, "./db"); err != nil {
 		log.Fatalf("Error al ejecutar las migraciones: %v", err)
 	}
 	fmt.Println("¡Migraciones aplicadas exitosamente!")
 
-	// -------------------------------
-	// Simular reservas concurrentes
-	// -------------------------------
-	// Simulamos intentos de reserva para el evento con ID 1,
-	// que  es "Concierto de Orquesta Sinfónica" con 50 asientos.
+	// Parámetros del evento.
 	eventoID := 1
-	totalSeats := 50
 
-	// Usamos un WaitGroup para rastrear la finalización de todas las gorutinas.
-	var wg sync.WaitGroup
-	const numReservations = 20 // Número de intentos de reserva concurrentes
-
-	// Creamos un generador de números aleatorios para seleccionar asientos al azar.
-	randSource := rand.NewSource(time.Now().UnixNano())
-	rnd := rand.New(randSource)
-
-	// Inicia intentos de reserva concurrentes.
-	for i := 0; i < numReservations; i++ {
-		wg.Add(1)
-		go func(userID string) {
-			defer wg.Done()
-
-			// Selecciona un número de asiento aleatorio entre 1 y totalSeats.
-			asientoNum := rnd.Intn(totalSeats) + 1
-
-			// Intenta reservar el asiento seleccionado.
-			err := reserveAsiento(db, eventoID, asientoNum, userID)
-			if err != nil {
-				log.Printf("Reserva fallida para el usuario %s en el asiento %d: %v", userID, asientoNum, err)
-			} else {
-				log.Printf("Reserva exitosa para el usuario %s en el asiento %d", userID, asientoNum)
-			}
-		}(fmt.Sprintf("user_%d", i+1))
+	// Definición de los casos de prueba.
+	testCases := []struct {
+		numUsuarios   int
+		isolationName string
+		isolation     sql.IsolationLevel
+	}{
+		{numUsuarios: 5, isolationName: "READ COMMITTED", isolation: sql.LevelReadCommitted},
+		{numUsuarios: 10, isolationName: "REPEATABLE READ", isolation: sql.LevelRepeatableRead},
+		{numUsuarios: 20, isolationName: "SERIALIZABLE", isolation: sql.LevelSerializable},
+		{numUsuarios: 30, isolationName: "SERIALIZABLE", isolation: sql.LevelSerializable},
 	}
 
-	wg.Wait()
-	fmt.Println("Se completaron todos los intentos de reserva.")
+	// Imprime la cabecera de la tabla de resultados en consola.
+	fmt.Println("\nUsuarios  Nivel de Aislamiento  Reservas Exitosas  Reservas Fallidas  Tiempo Promedio (ms)")
+	fmt.Println("-------------------------------------------------------------------------------")
+
+	// Almacena los resultados en un slice para luego exportarlos a CSV.
+	var allResults []testResult
+	for _, tc := range testCases {
+		result := runTest(db, tc.numUsuarios, tc.isolation, tc.isolationName, eventoID, totalSeats)
+		allResults = append(allResults, result)
+		fmt.Printf("%-9d %-22s %-19d %-18d %-10d\n", result.numUsuarios, result.isolationName, result.successCount, result.failureCount, result.avgDuration.Milliseconds())
+		time.Sleep(1 * time.Second)
+	}
+
+	// Exporta los resultados a un archivo CSV.
+	csvFilename := "resultados.csv"
+	if err := exportToCSV(allResults, csvFilename); err != nil {
+		log.Fatalf("Error al exportar resultados a CSV: %v", err)
+	}
+	fmt.Printf("\nArchivo CSV generado exitosamente: %s\n", csvFilename)
 }
